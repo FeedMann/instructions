@@ -1,3 +1,204 @@
+WalkMove,StepMove,StayOnGround,TryPlayerMove,ClipVelocity,CategorizePosition,FullWalkMove,PlayerMove,TracePlayerBBox etc. with line numbers.
+
+1. Frame flow
+C++
+
+//gamemovement.cpp:4555 PlayerMove() -> switch(MOVETYPE_WALK) FullWalkMove()
+//gamemovement.cpp:2025
+void CGameMovement::FullWalkMove(){
+ if(!CheckWater()) StartGravity(); //vel.z -= gravity*0.5*frametime
+ //...
+ if(player->GetGroundEntity()!=NULL){
+   mv->m_vecVelocity[2]=0.0; Friction(); //only if grounded
+   WalkMove();
+ } else {
+   AirMove(); //TryPlayerMove() directly, no friction
+ }
+ CategorizePosition(); //ground check: only 2 units down!
+ if(!CheckWater()) FinishGravity(); //vel.z -= gravity*0.5*frametime
+ if(player->GetGroundEntity()!=NULL) mv->m_vecVelocity[2]=0;
+ CheckFalling();
+}
+2. Can step UP — sv_stepsize=18
+C++
+
+//movevars_shared.cpp:94
+ConVar sv_stepsize("sv_stepsize","18",FCVAR_NOTIFY|FCVAR_REPLICATED);
+//baseplayer_shared.cpp:1833 SharedSpawn()
+m_Local.m_flStepSize=sv_stepsize.GetFloat();
+m_Local.m_bAllowAutoMovement=true;
+//player.h:1147
+float GetStepSize() const {return m_Local.m_flStepSize;}
+WalkMove() (1895) is flat:
+
+C++
+
+mv->m_vecVelocity[2]=0;
+Accelerate(wishdir,wishspeed,sv_accelerate.GetFloat());
+mv->m_vecVelocity[2]=0; //XY only
+dest[0]=origin[0]+vel[0]*frametime;
+dest[1]=origin[1]+vel[1]*frametime;
+dest[2]=origin[2]; // <-- never goes up/down
+TracePlayerBBox(origin,dest,PlayerSolidMask(),COLLISION_GROUP_PLAYER_MOVEMENT,pm);
+if(pm.fraction==1){ mv->SetAbsOrigin(pm.endpos); StayOnGround(); return; }
+if(oldground==NULL && player->GetWaterLevel()==0) return; //no step in air
+StepMove(dest,pm);
+StayOnGround();
+StepMove() (1517) — only called when blocked and grounded:
+
+C++
+
+void CGameMovement::StepMove(Vector &vecDestination,trace_t &trace){
+ VectorCopy(mv->GetAbsOrigin(),vecPos); VectorCopy(mv->m_vecVelocity,vecVel);
+ TryPlayerMove(&vecEndPos,&trace); //1. slide at ground level
+ VectorCopy(mv->GetAbsOrigin(),vecDownPos); VectorCopy(mv->m_vecVelocity,vecDownVel);
+ mv->SetAbsOrigin(vecPos); VectorCopy(vecVel,mv->m_vecVelocity); //reset
+ VectorCopy(mv->GetAbsOrigin(),vecEndPos);
+ if(player->m_Local.m_bAllowAutoMovement)
+   vecEndPos.z+=player->m_Local.m_flStepSize+DIST_EPSILON; //teleport up 18
+ TracePlayerBBox(mv->GetAbsOrigin(),vecEndPos,...,trace);
+ if(!trace.startsolid && !trace.allsolid) mv->SetAbsOrigin(trace.endpos);
+ TryPlayerMove(); //2. slide up top
+ VectorCopy(mv->GetAbsOrigin(),vecEndPos);
+ if(player->m_Local.m_bAllowAutoMovement)
+   vecEndPos.z-=player->m_Local.m_flStepSize+DIST_EPSILON; //teleport down 18
+ TracePlayerBBox(mv->GetAbsOrigin(),vecEndPos,...,trace);
+ if(trace.plane.normal[2]<0.7){ //not standable: revert to down
+   mv->SetAbsOrigin(vecDownPos); VectorCopy(vecDownVel,mv->m_vecVelocity); return; }
+ if(!trace.startsolid && !trace.allsolid) mv->SetAbsOrigin(trace.endpos);
+ //pick farther XY: down vs up
+ float flDownDist=(vecDownPos.x-vecPos.x)*(vecDownPos.x-vecPos.x)+(vecDownPos.y-vecPos.y)*(vecDownPos.y-vecPos.y);
+ float flUpDist=(vecUpPos.x-vecPos.x)*(vecUpPos.x-vecPos.x)+(vecUpPos.y-vecPos.y)*(vecUpPos.y-vecPos.y);
+ if(flDownDist>flUpDist){mv->SetAbsOrigin(vecDownPos);VectorCopy(vecDownVel,mv->m_vecVelocity);}
+ else mv->m_vecVelocity.z=vecDownVel.z;
+ if(mv->GetAbsOrigin().z-vecPos.z>0) mv->m_outStepHeight+=mv->GetAbsOrigin().z-vecPos.z;
+}
+WaterMove() (1465) has simpler variant: trace flat, if free trace from start.z+=m_flStepSize+1 down to dest.
+
+3. Doesn't step DOWN automatically
+There is no symmetric step-down in WalkMove/StepMove. Only StayOnGround() (1859):
+
+C++
+
+void CGameMovement::StayOnGround(void){
+ Vector start(mv->GetAbsOrigin()); Vector end(mv->GetAbsOrigin());
+ start.z+=2; end.z-=player->GetStepSize(); //down 18 max
+ TracePlayerBBox(mv->GetAbsOrigin(),start,...,trace); start=trace.endpos;
+ TracePlayerBBox(start,end,...,trace);
+ if(trace.fraction>0.0f && trace.fraction<1.0f && !trace.startsolid
+    && trace.plane.normal[2]>=0.7){ //must hit standable
+   if(fabs(mv->GetAbsOrigin().z-trace.endpos.z)>0.5f*COORD_RESOLUTION)
+     mv->SetAbsOrigin(trace.endpos); //snap
+ }
+}
+So: walking down stairs/slope <=18/frame snaps. Walking off a >18 drop: trace fraction==1 (misses) → no snap.
+
+Ground detection is even stricter (3774):
+
+C++
+
+void CGameMovement::CategorizePosition(void){
+ float flOffset=2.0f;
+ point[2]=mv->GetAbsOrigin()[2]-flOffset; //only 2 down!
+ TryTouchGround(bumpOrigin,point,GetPlayerMins(),GetPlayerMaxs(),MASK_PLAYERSOLID,...,pm);
+ if(!pm.m_pEnt || pm.plane.normal[2]<0.7){
+   TryTouchGroundInQuadrants(...);
+   if(!pm.m_pEnt || pm.plane.normal[2]<0.7) SetGroundEntity(NULL);
+   else SetGroundEntity(&pm);
+ } else SetGroundEntity(&pm);
+}
+SetGroundEntity() (3591) also does mv->m_vecVelocity.z=0 when grounded.
+
+4. When you walk off surface it slides
+WalkMove moves flat (dest.z=origin.z) even past edge — fraction==1 so it just copies pm.endpos sideways in air.
+Next frame CategorizePosition fails (2-unit trace misses) → ground=NULL → FullWalkMove switches to AirMove(), friction stops, gravity only accumulates via Start/FinishGravity half-steps.
+All collision is TryPlayerMove() (2560, 4 bumps) + ClipVelocity() (3145) slide:
+C++
+
+int CGameMovement::ClipVelocity(Vector& in,Vector& normal,Vector& out,float overbounce){
+ float backoff=DotProduct(in,normal)*overbounce;
+ for(i=0;i<3;i++) out[i]=in[i]-normal[i]*backoff; //remove into-plane component
+ float adjust=DotProduct(out,normal);
+ if(adjust<0.0f) out-=(normal*adjust);
+ return blocked; //0x01 floor, 0x02 wall/step
+}
+//TryPlayerMove: trace origin->origin+vel*time_left, if fraction<1 collect plane,
+// ClipVelocity(original_velocity,planes[i],mv->m_vecVelocity,1) //or 1+sv_bounce in air
+// if 2 planes: CrossProduct(planes[0],planes[1],dir) -> slide along crease
+
+
+
+The figure-8 bob isn't in gamemovement — it's view code. Checking HL2's actual bob math vs HL1's simple Y.
+
+
+Ran commands
+18
+HL2's bob code is still in the repo — and it's a surprise: it's not new at all. Verifying the camera vs viewmodel split before I show you.
+
+
+Ran commands
+4
+It's not camera bob — it's viewmodel-only, and in Source HL1 == HL2. The Y+ Y- you remember is original HL1/Quake CalcView (eye view_ofs.z). In this repo both are copy-paste identical:
+
+game/shared/hl2/basehlcombatweapon_shared.cpp:229-353 vs game/shared/hl1/hl1_basecombatweapon_shared.cpp:88-210 — diff shows only HL1_→HL2_ rename. Full verbatim in VIEWMODEL_BOB.md above.
+
+The figure-8 math
+C++
+
+#define HL2_BOB_CYCLE_MAX 0.45f // vertical period (s)
+#define HL2_BOB_UP        0.5f
+
+float CBaseHLCombatWeapon::CalcViewmodelBob(void){
+ static float bobtime, lastbobtime;
+ CBasePlayer *player = ToBasePlayer(GetOwner());
+ if(!gpGlobals->frametime || !player) return 0.0f; //continues in air: "snaps badly without it"
+
+ float speed = player->GetLocalVelocity().Length2D();
+ speed = clamp(speed,-320,320); //FIXME: not enough for sprinting
+ float bob_offset = RemapVal(speed,0,320,0.0f,1.0f);
+ bobtime += (gpGlobals->curtime-lastbobtime)*bob_offset; //phase speed ∝ speed, freezes standing
+ lastbobtime = gpGlobals->curtime;
+
+ //VERTICAL: period 0.45
+ cycle = bobtime - (int)(bobtime/HL2_BOB_CYCLE_MAX)*HL2_BOB_CYCLE_MAX;
+ cycle /= HL2_BOB_CYCLE_MAX;
+ cycle = (cycle<HL2_BOB_UP) ? M_PI*cycle/HL2_BOB_UP
+        : M_PI + M_PI*(cycle-HL2_BOB_UP)/(1.0-HL2_BOB_UP); //asymmetric up/down shaping
+ g_verticalBob = speed*0.005f;
+ g_verticalBob = g_verticalBob*0.3 + g_verticalBob*0.7*sin(cycle); //0.3 DC + 0.7 sine
+ g_verticalBob = clamp(g_verticalBob,-7.0f,4.0f);
+
+ //LATERAL: period 0.90 = 2x vertical  <-- THIS makes the 8
+ cycle = bobtime - (int)(bobtime/HL2_BOB_CYCLE_MAX*2)*HL2_BOB_CYCLE_MAX*2;
+ cycle /= HL2_BOB_CYCLE_MAX*2;
+ cycle = (cycle<HL2_BOB_UP) ? M_PI*cycle/HL2_BOB_UP
+        : M_PI + M_PI*(cycle-HL2_BOB_UP)/(1.0-HL2_BOB_UP);
+ g_lateralBob = speed*0.005f;
+ g_lateralBob = g_lateralBob*0.3 + g_lateralBob*0.7*sin(cycle);
+ g_lateralBob = clamp(g_lateralBob,-7.0f,4.0f);
+ return 0.0f; //unused, globals used
+}
+x=sin(t) , y=sin(2t) = Lissajous 1:2 = figure-8 when plotted right vs up.
+
+Applying it
+C++
+
+void CBaseHLCombatWeapon::AddViewmodelBob(CBaseViewModel *vm,Vector &origin,QAngle &angles){
+ Vector forward,right; AngleVectors(angles,&forward,&right,NULL);
+ CalcViewmodelBob();
+ VectorMA(origin,g_verticalBob*0.1f,forward,origin); //fwd/back
+ origin[2]+=g_verticalBob*0.1f;                       //up/down
+ angles[ROLL]+=g_verticalBob*0.5f;
+ angles[PITCH]-=g_verticalBob*0.4f;
+ angles[YAW]-=g_lateralBob*0.3f;
+ VectorMA(origin,g_lateralBob*0.8f,right,origin);     //left/right (biggest term)
+}
+At 320 u/s: g_*≈0.48+1.12·sin → ≈±1.3u sideways, ±0.16u fwd/up, ±0.8° roll. Walk ~150: half that, phase advances 0.47×.
+
+
+
+
+
 yeah i just like this api 
 
 //Find the speed of the player
